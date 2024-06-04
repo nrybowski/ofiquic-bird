@@ -16,6 +16,7 @@
 #define LIBSSH_LEGACY_0_4
 #include <libssh/libssh.h>
 #endif
+#include "quic_sock/sock_api_common.h"
 
 #ifdef HAVE_LIBSSH
 struct ssh_sock {
@@ -79,12 +80,14 @@ typedef struct birdsock {
   const char *password;			/* Password for MD5 authentication */
   const char *err;			/* Error message */
   struct ssh_sock *ssh;			/* Used in SK_SSH */
+  struct tls_config *tls_config;  /* Used for QUIC sockets */
 } sock;
 
 sock *sock_new(pool *);			/* Allocate new socket */
 #define sk_new(X) sock_new(X)		/* Wrapper to avoid name collision with OpenSSL */
 
 int sk_open(sock *);			/* Open socket */
+int sk_open_active_unix (sock *, const char *);
 int sk_rx_ready(sock *s);
 int sk_send(sock *, uint len);		/* Send data, <0=err, >0=ok, 0=sleep */
 int sk_send_to(sock *, uint len, ip_addr to, uint port); /* sk_send to given destination */
@@ -110,6 +113,14 @@ int sk_set_md5_auth(sock *s, ip_addr local, ip_addr remote, int pxlen, struct if
 int sk_set_ipv6_checksum(sock *s, int offset);
 int sk_set_icmp6_filter(sock *s, int p1, int p2);
 void sk_log_error(sock *s, const char *p);
+
+void sk_set_tls_config(sock *s, int insecure, const char *cert,
+                       const char *key, const char *alpn,
+                       const char *tls_keylog_file, int client_require_auth,
+                       const char *tls_root_ca, const char *remote_sni, const char *qlog_dir);
+
+int sk_open_stream(sock *s, void (*tx_hook)(struct birdsock *));
+void sk_close_transport(struct birdsock *sk);
 
 byte * sk_rx_buffer(sock *s, int *len);	/* Temporary */
 
@@ -144,6 +155,18 @@ extern int sk_priority_control;		/* Suggested priority for control traffic, shou
 #define SK_UNIX		9
 #define SK_SSH_ACTIVE	10         /* -  -  *  *  -  ?   -	DA = host */
 #define SK_SSH		11
+#define SK_QUIC 12
+#define SK_QUIC_ACTIVE 13
+#define SK_QUIC_ACTIVE_CONNECTED 14
+#define SK_QUIC_PASSIVE 15
+#define SK_QUIC_PASSIVE_CONNECTED 16
+#define SK_UNIX_ACTIVE 17
+
+#define QUIC_TYPE(s) ((s)->type == SK_QUIC || \
+                      (s)->type == SK_QUIC_ACTIVE || \
+                      (s)->type == SK_QUIC_ACTIVE_CONNECTED || \
+                      (s)->type == SK_QUIC_PASSIVE || \
+                      (s)->type == SK_QUIC_PASSIVE_CONNECTED)
 
 /*
  *	Socket subtypes

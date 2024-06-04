@@ -1,0 +1,3 @@
+[submodule "ofiquic"]
+	path = ofiquic
+	url = https://github.com/nrybowski/ofiquic.git

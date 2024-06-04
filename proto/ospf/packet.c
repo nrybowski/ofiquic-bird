@@ -384,10 +384,16 @@ drop:
 int
 ospf_rx_hook(sock *sk, uint len)
 {
+
+  // log("ospf_rx_hook %i %i", sk->lifindex, sk->iface->index);
   /* We want just packets from sk->iface. Unfortunately, on BSD we cannot filter
      out other packets at kernel level and we receive all packets on all sockets */
   if (sk->lifindex != sk->iface->index)
     return 1;
+
+
+  // log("check0: OSPF: RX hook called (iface %s, src %I, dst %I)",
+      // sk->iface->name, sk->faddr, sk->laddr);
 
   DBG("OSPF: RX hook called (iface %s, src %I, dst %I)\n",
       sk->iface->name, sk->faddr, sk->laddr);
@@ -650,11 +656,19 @@ ospf_verr_hook(sock *sk, int err)
 void
 ospf_send_to(struct ospf_iface *ifa, ip_addr dst)
 {
+  struct ospf_proto *ospf_proto;
   sock *sk = ifa->sk;
+
+  if (QUIC_TYPE(sk) && (ifa->sk != ifa->stream_sk)) {
+    log(L_INFO "send: kept on plain IP");
+    sk = ifa->ip_sk;
+  }
+
   struct ospf_packet *pkt = (struct ospf_packet *) sk->tbuf;
   uint plen = ntohs(pkt->length);
+  ospf_proto = ifa->oa->po;
 
-  if (ospf_is_v2(ifa->oa->po))
+  if (ospf_is_v2(ospf_proto))
     ospf_pkt_finalize2(ifa, pkt, &plen);
   else
     ospf_pkt_finalize3(ifa, pkt, &plen, sk->saddr);

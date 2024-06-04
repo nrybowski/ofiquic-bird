@@ -2151,6 +2151,8 @@ again2:
   WALK_SLIST(en, p->lsal)
     if (en->mode == LSA_M_RTCALC_STALE)
       ospf_flush_lsa(p, en);
+
+  if (p->ofib_notify) ev_schedule(p->ofib_notify);
 }
 
 

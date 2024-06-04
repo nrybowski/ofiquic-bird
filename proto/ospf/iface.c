@@ -112,11 +112,36 @@ find_nbma_node_(list *nnl, ip_addr ip)
   return NULL;
 }
 
+void
+ospf_open_trans_client_sk(struct ospf_iface *ifa) {
+  log("Create client transport socket.");
+
+  struct ospf_proto *p = ifa->oa->po;
+  struct ospf_config *c = (struct ospf_config *) p->p.cf;
+
+  /* Create the client-side transport socket */
+  sock *sk = sk_new(ifa->pool);
+  sk->type = SK_QUIC_ACTIVE;
+  sk_set_tls_config(sk, c->tls_insecure, c->tls_cert_path, c->tls_key_path, c->alpn,
+                    c->tls_secrets_path, c->tls_peer_require_auth, c->tls_root_ca,
+                    ifa->cf->tls_sni, "/tmp");
+  sk->saddr = ifa->addr->ip;
+  sk->rbsize = sk->tbsize = ifa_bufsize(ifa);
+  sk->iface = ifa->iface;
+  sk->laddr = ifa->addr->ip;
+  sk->data = (void *) ifa;
+  sk->tx_hook = ospf_iface_connected;
+  ifa->trans_cli_sk = sk;
+}
 
 static int
 ospf_sk_open(struct ospf_iface *ifa)
 {
   struct ospf_proto *p = ifa->oa->po;
+
+  /* Create the client-side transport socket */
+  ospf_open_trans_client_sk(ifa);
+  ifa->con_sk = NULL;
 
   sock *sk = sk_new(ifa->pool);
   sk->type = SK_IP;
@@ -167,7 +192,8 @@ ospf_sk_open(struct ospf_iface *ifa)
     }
   }
 
-  ifa->sk = sk;
+  ifa->ip_sk = sk;
+  ifa->sk = ifa->ip_sk;
   ifa->sk_dr = 0;
   return 1;
 
@@ -883,6 +909,7 @@ ospf_iface_reconfigure(struct ospf_iface *ifa, struct ospf_iface_patt *new)
 	       ifname, ifa->cost, new->cost);
 
     ifa->cost = new->cost;
+    WALK_LIST(p->ofib_neigh, ifa->neigh_list) { break; }
   }
 
   /* PRIORITY */

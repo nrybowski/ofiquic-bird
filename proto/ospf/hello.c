@@ -66,8 +66,14 @@ ospf_send_hello(struct ospf_iface *ifa, int kind, struct ospf_neighbor *dirn)
   if (ifa->stub)
     return;
 
+  if (QUIC_TYPE(ifa->sk) && (ifa->stream_sk != ifa->sk)) {
+    /* The transport stream is not open yet, we continue sending hellos on the IP socket */
+    log("hello: stayed on ip sk");
+    pkt = (struct ospf_packet*) ifa->ip_sk->tbuf;
+  } else
+    /* Plain IP sk or stream sk if it is available */
+    pkt = ospf_tx_buffer(ifa);
 
-  pkt = ospf_tx_buffer(ifa);
   ospf_pkt_fill_hdr(ifa, pkt, HELLO_P);
 
   if (ospf_is_v2(p))

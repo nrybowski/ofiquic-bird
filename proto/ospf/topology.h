@@ -8,6 +8,8 @@
  *	Can be freely distributed and used under the terms of the GNU GPL.
  */
 
+#include "ofib.h"
+
 #ifndef _BIRD_OSPF_TOPOLOGY_H_
 #define _BIRD_OSPF_TOPOLOGY_H_
 

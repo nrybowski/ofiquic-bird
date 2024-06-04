@@ -104,6 +104,7 @@ extern volatile sig_atomic_t async_config_flag;
 extern volatile sig_atomic_t async_dump_flag;
 extern volatile sig_atomic_t async_shutdown_flag;
 
+void io_quic_init(void);
 void io_init(void);
 void io_loop(void);
 void io_log_dump(void);

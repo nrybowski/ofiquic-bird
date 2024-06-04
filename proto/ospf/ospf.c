@@ -105,6 +105,7 @@
  */
 
 #include <stdlib.h>
+#include "lib/lists.h"
 #include "ospf.h"
 
 static int ospf_preexport(struct channel *P, rte *new);
@@ -273,6 +274,37 @@ ospf_cleanup_gr_recovery(struct ospf_proto *p)
   p->gr_cleanup = 0;
 }
 
+int ospf_sk_trans_rx_hook(sock *sk, uint UNUSED arg) {
+    log("Got a connection on srv transport sk");
+    struct ospf_proto *p = (struct ospf_proto*) sk->data;
+    struct ospf_iface *iface;
+    
+    // Got message from known neighbor
+    if (sk->iface) {
+	    WALK_LIST(iface, p->iface_list) {
+		if (iface->iface->index == sk->iface->index) {
+		    sk->data = (void*) iface;
+		    break;
+		}
+		sk->data = NULL;
+	    }
+
+	    if (!sk->data) bug("Expected interface not found.");
+
+	    if (!iface->con_sk) {
+	       sk->rx_hook = ospf_stream_rx_hook;
+	       iface->con_sk = sk;
+	       iface->sk = iface->con_sk;
+	       sk->laddr = sk->saddr;
+	    }
+    } else {
+	// Got message from remote
+	log(L_TRACE "Got a remote connection from unknown interface. %I", sk->faddr);
+	sk->rx_hook = ospf_stream_rx_hook;
+    }
+    return 1;
+}
+
 static int
 ospf_start(struct proto *P)
 {
@@ -294,8 +326,8 @@ ospf_start(struct proto *P)
   p->gr_mode = c->gr_mode;
   p->gr_time = c->gr_time;
   p->tick = c->tick;
-  p->disp_timer = tm_new_init(P->pool, ospf_disp, p, p->tick S, 0);
-  tm_start(p->disp_timer, 100 MS);
+  p->disp_timer = tm_new_init(P->pool, ospf_disp, p, p->tick MS, 0);
+  tm_start(p->disp_timer, 10 MS);
   p->lsab_size = 256;
   p->lsab_used = 0;
   p->lsab = mb_alloc(P->pool, p->lsab_size);
@@ -328,6 +360,27 @@ ospf_start(struct proto *P)
   struct ospf_iface_patt *ic;
   WALK_LIST(ic, c->vlink_list)
     ospf_iface_new_vlink(p, ic);
+
+  /* Create the server-side transport socket */
+  sock *srv_sk = sk_new(P->pool);
+  sk_set_tls_config(srv_sk, c->tls_insecure, c->tls_cert_path, c->tls_key_path,
+                    //c->alpn, c->tls_secrets_path, c->tls_peer_require_auth,
+                    c->alpn, c->tls_secrets_path, 0,
+                    c->tls_root_ca, c->tls_remote_sni, "/tmp");
+  srv_sk->type = SK_QUIC_PASSIVE;
+  srv_sk->sport = 4443;
+  srv_sk->rbsize = srv_sk->tbsize = 2048;
+  srv_sk->rx_hook = ospf_sk_trans_rx_hook;
+  srv_sk->data = (void*) p;
+  p->trans_serv_sk = srv_sk;
+
+  /* Transport server is launched */ 
+  if (sk_open(srv_sk) < 0)
+      return PS_DOWN;
+  
+  init_list(&(p->ofib));
+  p->ofib_neigh = NULL;
+  p->ofib_lsa_orignated = 0;
 
   return PS_UP;
 }
@@ -421,7 +474,7 @@ ospf_rte_igp_metric(struct rte *rt)
 void
 ospf_schedule_rtcalc(struct ospf_proto *p)
 {
-  if (p->calcrt)
+  if (p->calcrt || !EMPTY_LIST(p->ofib) || p->ofib_neigh)
     return;
 
   OSPF_TRACE(D_EVENTS, "Scheduling routing table calculation");
@@ -723,7 +776,7 @@ ospf_reconfigure(struct proto *P, struct proto_config *CF)
   p->gr_mode = new->gr_mode;
   p->gr_time = new->gr_time;
   p->tick = new->tick;
-  p->disp_timer->recurrent = p->tick S;
+  p->disp_timer->recurrent = p->tick MS;
   tm_start(p->disp_timer, 10 MS);
 
   /* Mark all areas and ifaces */

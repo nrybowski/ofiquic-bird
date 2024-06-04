@@ -201,6 +201,8 @@ CF_KEYWORDS(WAIT, DELAY, LSADB, ECMP, LIMIT, WEIGHT, NSSA, TRANSLATOR, STABILITY
 CF_KEYWORDS(GLOBAL, LSID, ROUTER, SELF, INSTANCE, REAL, NETMASK, TX, PRIORITY, LENGTH)
 CF_KEYWORDS(MERGE, LSA, SUPPRESSION, MULTICAST, RFC5838, VPN, PE, ADDRESS)
 CF_KEYWORDS(GRACEFUL, RESTART, AWARE, TIME)
+CF_KEYWORDS(CERTIFICATE, KEY, SECRETS, ALPN, TLS, INSECURE, CA,
+            REQUIRE, ROOT, REMOTE, SNI, PEER, AUTH, OFIB)
 
 %type <ld> lsadb_args
 %type <i> ospf_variant ospf_af_mc nbma_eligible
@@ -229,6 +231,10 @@ ospf_proto_start: proto_start ospf_variant
   OSPF_CFG->af_ext = !$2;
   OSPF_CFG->gr_mode = OSPF_GR_AWARE;
   OSPF_CFG->gr_time = OSPF_DEFAULT_GR_TIME;
+  OSPF_CFG->tls_secrets_path = NULL;
+  OSPF_CFG->tls_root_ca = NULL;
+  OSPF_CFG->tls_peer_require_auth = 1;
+  OSPF_CFG->tls_insecure = 1;
 };
 
 ospf_proto:
@@ -268,6 +274,14 @@ ospf_proto_item:
  | MERGE EXTERNAL bool { OSPF_CFG->merge_external = $3; }
  | TICK expr { OSPF_CFG->tick = $2; if($2 <= 0) cf_error("Tick must be greater than zero"); }
  | INSTANCE ID expr { OSPF_CFG->instance_id = $3; OSPF_CFG->instance_id_set = 1; if ($3 > 255) cf_error("Instance ID must be in range 0-255"); }
+ | TLS CERTIFICATE text {OSPF_CFG->tls_cert_path = $3; }
+ | TLS KEY TEXT {OSPF_CFG->tls_key_path = $3; }
+ | ALPN TEXT { OSPF_CFG->alpn = $2; if (strnlen($2, 16) > 15) cf_error("ALPN must be at most 15 characters");}
+ | TLS INSECURE bool { OSPF_CFG->tls_insecure = $3; }
+ | TLS SECRETS TEXT { OSPF_CFG->tls_secrets_path = $3; }
+ | TLS PEER REQUIRE AUTH bool { OSPF_CFG->tls_peer_require_auth = $5; }
+ | TLS ROOT CA text { OSPF_CFG->tls_root_ca = $4; }
+ | OFIB TYPE expr { OSPF_CFG->ofib_type = $3; }
  | ospf_area
  ;
 
@@ -416,6 +430,7 @@ ospf_iface_item:
  | TTL SECURITY bool { OSPF_PATT->ttl_security = $3; }
  | TTL SECURITY TX ONLY { OSPF_PATT->ttl_security = 2; }
  | BFD bool { OSPF_PATT->bfd = $2; cf_check_bfd($2); }
+ | TLS SNI text {OSPF_PATT->tls_sni = $3;}
  | password_list
  ;
 
@@ -478,6 +493,7 @@ ospf_iface_start:
   OSPF_PATT->ptp_address = 2; /* not specified */
   OSPF_PATT->tx_tos = IP_PREC_INTERNET_CONTROL;
   OSPF_PATT->tx_priority = sk_priority_control;
+  OSPF_PATT->tls_sni = NULL; 
   reset_passwords();
  }
 ;

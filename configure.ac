@@ -77,6 +77,11 @@ AC_ARG_WITH([iproutedir],
 AC_ARG_VAR([FLEX], [location of the Flex program])
 AC_ARG_VAR([BISON], [location of the Bison program])
 AC_ARG_VAR([M4], [location of the M4 program])
+AC_ARG_VAR([PICOQUIC_LIB], [location of the Picoquic library])
+AC_ARG_VAR([PICOQUIC_SOCK_API_LIB], [location of the Picoquic socket API library])
+AC_ARG_VAR([PICOQUIC_SOCK_API_HDR], [location of the Picoquic socket API headers])
+AC_ARG_VAR([OFIB_LIB], [location of the oFIB library])
+AC_ARG_VAR([OFIB_HDR], [location of the oFIB headers])
 
 if test "$enable_debug_expensive" = yes; then
   enable_debug=yes
@@ -186,6 +191,33 @@ AC_CHECK_PROGS([M4], [gm4 m4])
 test -z "$FLEX"	 && AC_MSG_ERROR([Flex is missing.])
 test -z "$BISON" && AC_MSG_ERROR([Bison is missing.])
 test -z "$M4"	 && AC_MSG_ERROR([M4 is missing.])
+test -z "$PICOQUIC_LIB" && AC_MSG_ERROR([Picoquic libs are missing.])
+test -z "$PICOQUIC_SOCK_API_LIB" && AC_MSG_ERROR([Picoquic Socket API lib is missing.])
+test -z "$PICOQUIC_SOCK_API_HDR" && AC_MSG_ERROR([Picoquic Socket API headers are missing.])
+test -z "$OFIB_LIB" && AC_MSG_ERROR([oFIB lib is missing.])
+test -z "$OFIB_HDR" && AC_MSG_ERROR([oFIB headers are missing.])
+
+
+LDFLAGS="-L$PICOQUIC_LIB $LDFLAGS"
+
+LIBS="$(pkg-config --libs openssl) $LIBS"
+LIBS="$(pkg-config --libs libevent_pthreads) $LIBS"
+
+AC_CHECK_LIB([picotls-core], [ptls_server_new], [], [AC_MSG_ERROR([Picotls not found])], [])
+AC_CHECK_LIB([picotls-openssl], [ptls_openssl_load_certificates], [], [AC_MSG_ERROR([Picotls openssl not found])], [])
+AC_CHECK_LIB([picotls-fusion], [ptls_fusion_is_supported_by_cpu], [], [AC_MSG_ERROR([Picotls fusion not found])], [])
+AC_CHECK_LIB([picoquic-core], [picoquic_incoming_packet_ex], [],[AC_MSG_ERROR([Picoquic lib not found (Is PICOQUIC_LIB correctly configured ?))])], [])
+
+LDFLAGS="-L$PICOQUIC_SOCK_API_LIB $LDFLAGS"
+CFLAGS="-I$PICOQUIC_SOCK_API_HDR $CFLAGS"
+
+AC_CHECK_LIB([quicsock_common], [eventfd_new], [], [AC_MSG_ERROR([quicsock_common lib not found])], [])
+
+AC_CHECK_HEADER([quic_sock/picoquic_sock_api.h], [], [AC_MSG_ERROR([Picoquic Socket API headers not found (Is PICOQUIC_SOCK_API_HDR correctly configured ?)])])
+
+AC_CHECK_LIB([picoquic_sock], [picoquic_read], [],[AC_MSG_ERROR([Picoquic lib not found (Is PICOQUIC_SOCK_API_LIB correctly configured ?))])], [])
+
+
 
 AC_MSG_CHECKING([bison version])
 BIRD_CHECK_BISON_VERSION(BISON_VERSION)
@@ -457,6 +489,13 @@ AC_SUBST([CLIENT_LIBS])
 
 mkdir -p $objdir/sysdep
 AC_CONFIG_HEADERS([$objdir/sysdep/autoconf.h:sysdep/autoconf.h.in])
+
+CFLAGS="-Iproto/ospf -I$OFIB_HDR $CFLAGS"
+#AC_CONFIG_HEADER([ofib.h], [], [AC_MSG_ERROR([oFIB headers not found])])
+
+LDFLAGS="-L$OFIB_LIB $LDFLAGS"
+AC_CHECK_LIB([ofibrs], [ofib_init], [], [AC_MSG_ERROR([oFIB lib not found])], [])
+
 AC_CONFIG_FILES([Makefile:Makefile.in])
 AC_OUTPUT
 

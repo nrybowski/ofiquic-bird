@@ -28,7 +28,9 @@
 #include "nest/bfd.h"
 #include "conf/conf.h"
 #include "lib/string.h"
+// #include "lib/evt_notifier.h"
 
+#include "ospf_defs.h"
 
 #ifdef LOCAL_DEBUG
 #define OSPF_FORCE_DEBUG 1
@@ -66,13 +68,13 @@
 
 #define LSREFRESHTIME		1800	/* 30 minutes */
 #define MINLSINTERVAL		(5 S_)
-#define MINLSARRIVAL		(1 S_)
+#define MINLSARRIVAL		(1 MS_)
 #define LSINFINITY		0xffffff
 
 #define OSPF_PKT_TYPES		5	/* HELLO_P .. LSACK_P */
 #define OSPF3_CRYPTO_ID		1	/* OSPFv3 Cryptographic Protocol ID */
 
-#define OSPF_DEFAULT_TICK 1
+#define OSPF_DEFAULT_TICK 10
 #define OSPF_DEFAULT_STUB_COST 1000
 #define OSPF_DEFAULT_ECMP_LIMIT 16
 #define OSPF_DEFAULT_GR_TIME 120
@@ -106,7 +108,19 @@ struct ospf_config
   uint ecmp;
   list area_list;		/* list of area configs (struct ospf_area_config) */
   list vlink_list;		/* list of configured vlinks (struct ospf_iface_patt) */
+  const char *tls_cert_path;
+  const char *tls_key_path;
+  const char *tls_secrets_path;
+  const char *tls_remote_sni;
+  const char *tls_root_ca;
+  u8 tls_peer_require_auth;
+  u8 tls_insecure;
+  u8 ofib_type;
+  const char *alpn;
+  const char *ctrl_path;
 };
+
+
 
 struct ospf_area_config
 {
@@ -194,6 +208,7 @@ struct ospf_iface_patt
   u8 ptp_address;		/* bool + 2 for unspecified */
   u8 ttl_security;		/* bool + 2 for TX only */
   u8 bfd;
+  const char *tls_sni;
   list *passwords;
 };
 
@@ -252,6 +267,11 @@ struct ospf_proto
   u32 last_vlink_id;		/* Interface IDs for vlinks (starts at 0x80000000) */
   struct tbf log_pkt_tbf;	/* TBF for packet messages */
   struct tbf log_lsa_tbf;	/* TBF for LSA messages */
+  sock *trans_serv_sk;		/* Transport socket */
+  list ofib;			/* Ordered prefix list */
+  event *ofib_notify;		/* Event to notify parent node that we converged */
+  struct ospf_neighbor *ofib_neigh;
+  u8 ofib_lsa_orignated;
 };
 
 struct ospf_area
@@ -285,6 +305,10 @@ struct ospf_iface
 
   pool *pool;
   sock *sk;			/* IP socket */
+  sock *trans_cli_sk;
+  sock *ip_sk;
+  sock *stream_sk;
+  sock *con_sk;
   list neigh_list;		/* List of neighbors (struct ospf_neighbor) */
   u32 cost;			/* Cost of iface */
   u32 waitint;			/* Number of seconds before changing state from wait */
@@ -359,6 +383,7 @@ struct ospf_neighbor
   node n;
   pool *pool;
   struct ospf_iface *ifa;
+
   u8 state;
   u8 gr_active;			/* We act as GR helper for the neighbor */
   u8 got_my_rt_lsa;		/* Received my Rt-LSA in DBDES exchanged */
@@ -510,311 +535,7 @@ struct ospf_neighbor
 #define OPT_PX_DN	0x10
 
 
-struct ospf_packet
-{
-  u8 version;
-  u8 type;
-  u16 length;
-  u32 routerid;
-  u32 areaid;
-  u16 checksum;
-  u8 instance_id;		/* See RFC 6549 */
-  u8 autype;			/* Undefined for OSPFv3 */
-};
 
-struct ospf_lls
-{
-  u16 checksum;
-  u16 length;
-  byte data[0];
-};
-
-struct ospf_auth_crypto
-{
-  u16 zero;
-  u8 keyid;
-  u8 len;
-  u32 csn;			/* Cryptographic sequence number (32-bit) */
-};
-
-union ospf_auth2
-{
-  u8 password[8];
-  struct ospf_auth_crypto c32;
-};
-
-struct ospf_auth3
-{
-  u16 type;			/* Authentication type (OSPF3_AUTH_*) */
-  u16 length;			/* Authentication trailer length (header + data) */
-  u16 reserved;
-  u16 sa_id;			/* Security association identifier (key_id) */
-  u64 csn;			/* Cryptographic sequence number (64-bit) */
-  byte data[0];			/* Authentication data */
-};
-
-
-/* Packet types */
-#define HELLO_P		1	/* Hello */
-#define DBDES_P		2	/* Database description */
-#define LSREQ_P		3	/* Link state request */
-#define LSUPD_P		4	/* Link state update */
-#define LSACK_P		5	/* Link state acknowledgement */
-
-
-#define DBDES_I		4	/* Init bit */
-#define DBDES_M		2	/* More bit */
-#define DBDES_MS	1	/* Master/Slave bit */
-#define DBDES_IMMS	(DBDES_I | DBDES_M | DBDES_MS)
-
-
-/* OSPFv3 LSA Types / LSA Function Codes */
-/* https://www.iana.org/assignments/ospfv3-parameters/ospfv3-parameters.xhtml#ospfv3-parameters-3 */
-#define LSA_T_RT		0x2001
-#define LSA_T_NET		0x2002
-#define LSA_T_SUM_NET		0x2003
-#define LSA_T_SUM_RT		0x2004
-#define LSA_T_EXT		0x4005
-#define LSA_T_NSSA		0x2007
-#define LSA_T_LINK		0x0008
-#define LSA_T_PREFIX		0x2009
-#define LSA_T_GR		0x000B
-#define LSA_T_RI_		0x000C
-#define LSA_T_RI_LINK		0x800C
-#define LSA_T_RI_AREA		0xA00C
-#define LSA_T_RI_AS		0xC00C
-#define LSA_T_OPAQUE_		0x1FFF
-#define LSA_T_OPAQUE_LINK	0x9FFF
-#define LSA_T_OPAQUE_AREA	0xBFFF
-#define LSA_T_OPAQUE_AS	 	0xDFFF
-
-#define LSA_T_V2_OPAQUE_	0x0009
-#define LSA_T_V2_MASK		0x00ff
-
-/* OSPFv2 Opaque LSA Types */
-/* https://www.iana.org/assignments/ospf-opaque-types/ospf-opaque-types.xhtml#ospf-opaque-types-2 */
-#define LSA_OT_GR		0x03
-#define LSA_OT_RI		0x04
-
-#define LSA_FUNCTION_MASK	0x1FFF
-#define LSA_FUNCTION(type)	((type) & LSA_FUNCTION_MASK)
-
-#define LSA_UBIT		0x8000
-
-#define LSA_SCOPE_LINK		0x0000
-#define LSA_SCOPE_AREA		0x2000
-#define LSA_SCOPE_AS		0x4000
-#define LSA_SCOPE_RES		0x6000
-#define LSA_SCOPE_MASK		0x6000
-#define LSA_SCOPE(type)		((type) & LSA_SCOPE_MASK)
-#define LSA_SCOPE_ORDER(type)	(((type) >> 13) & 0x3)
-
-
-#define LSA_MAXAGE	3600	/* 1 hour */
-#define LSA_CHECKAGE	300	/* 5 minutes */
-#define LSA_MAXAGEDIFF	900	/* 15 minutes */
-
-#define LSA_ZEROSEQNO	((s32) 0x80000000)
-#define LSA_INITSEQNO	((s32) 0x80000001)
-#define LSA_MAXSEQNO	((s32) 0x7fffffff)
-
-#define LSA_METRIC_MASK  0x00FFFFFF
-#define LSA_OPTIONS_MASK 0x00FFFFFF
-
-
-#define LSART_PTP	1
-#define LSART_NET	2
-#define LSART_STUB	3
-#define LSART_VLNK	4
-
-#define LSA_RT2_LINKS	0x0000FFFF
-
-#define LSA_SUM2_TOS	0xFF000000
-
-#define LSA_EXT2_TOS	0x7F000000
-#define LSA_EXT2_EBIT	0x80000000
-
-#define LSA_EXT3_EBIT	0x04000000
-#define LSA_EXT3_FBIT	0x02000000
-#define LSA_EXT3_TBIT	0x01000000
-
-/* OSPF Grace LSA (GR) TLVs */
-/* https://www.iana.org/assignments/ospfv2-parameters/ospfv2-parameters.xhtml#ospfv2-parameters-13 */
-#define LSA_GR_PERIOD		1
-#define LSA_GR_REASON		2
-#define LSA_GR_ADDRESS		3
-
-/* OSPF Router Information (RI) TLVs */
-/* https://www.iana.org/assignments/ospf-parameters/ospf-parameters.xhtml#ri-tlv */
-#define LSA_RI_RIC		1
-#define LSA_RI_RFC		2
-
-/* OSPF Router Informational Capability Bits */
-/* https://www.iana.org/assignments/ospf-parameters/ospf-parameters.xhtml#router-informational-capability */
-#define LSA_RIC_GR_CAPABLE	0
-#define LSA_RIC_GR_HELPER	1
-#define LSA_RIC_STUB_ROUTER	2
-
-
-struct ospf_lsa_header
-{
-  u16 age;			/* LS Age */
-  u16 type_raw;			/* Type, mixed with options on OSPFv2 */
-
-  u32 id;
-  u32 rt;			/* Advertising router */
-  s32 sn;			/* LS Sequence number */
-  u16 checksum;
-  u16 length;
-};
-
-
-/* In OSPFv2, options are embedded in higher half of type_raw */
-static inline u8 lsa_get_options(struct ospf_lsa_header *lsa)
-{ return lsa->type_raw >> 8; }
-
-static inline void lsa_set_options(struct ospf_lsa_header *lsa, u16 options)
-{ lsa->type_raw = (lsa->type_raw & 0xff) | (options << 8); }
-
-
-struct ospf_lsa_rt
-{
-  u32 options;	/* VEB flags, mixed with link count for OSPFv2 and options for OSPFv3 */
-};
-
-struct ospf_lsa_rt2_link
-{
-  u32 id;
-  u32 data;
-#ifdef CPU_BIG_ENDIAN
-  u8 type;
-  u8 no_tos;
-  u16 metric;
-#else
-  u16 metric;
-  u8 no_tos;
-  u8 type;
-#endif
-};
-
-struct ospf_lsa_rt2_tos
-{
-#ifdef CPU_BIG_ENDIAN
-  u8 tos;
-  u8 padding;
-  u16 metric;
-#else
-  u16 metric;
-  u8 padding;
-  u8 tos;
-#endif
-};
-
-struct ospf_lsa_rt3_link
-{
-#ifdef CPU_BIG_ENDIAN
-  u8 type;
-  u8 padding;
-  u16 metric;
-#else
-  u16 metric;
-  u8 padding;
-  u8 type;
-#endif
-  u32 lif;	/* Local interface ID */
-  u32 nif;	/* Neighbor interface ID */
-  u32 id;	/* Neighbor router ID */
-};
-
-
-struct ospf_lsa_net
-{
-  u32 optx;	/* Netmask for OSPFv2, options for OSPFv3 */
-  u32 routers[];
-};
-
-struct ospf_lsa_sum2
-{
-  u32 netmask;
-  u32 metric;
-};
-
-struct ospf_lsa_sum3_net
-{
-  u32 metric;
-  u32 prefix[];
-};
-
-struct ospf_lsa_sum3_rt
-{
-  u32 options;
-  u32 metric;
-  u32 drid;
-};
-
-struct ospf_lsa_ext2
-{
-  u32 netmask;
-  u32 metric;
-  u32 fwaddr;
-  u32 tag;
-};
-
-struct ospf_lsa_ext3
-{
-  u32 metric;
-  u32 rest[];
-};
-
-struct ospf_lsa_ext_local
-{
-  net_addr net;
-  ip_addr fwaddr;
-  u32 metric, ebit, fbit, tag, propagate, downwards;
-  u8 pxopts;
-};
-
-struct ospf_lsa_link
-{
-  u32 options;
-  ip6_addr lladdr;
-  u32 pxcount;
-  u32 rest[];
-};
-
-struct ospf_lsa_prefix
-{
-#ifdef CPU_BIG_ENDIAN
-  u16 pxcount;
-  u16 ref_type;
-#else
-  u16 ref_type;
-  u16 pxcount;
-#endif
-  u32 ref_id;
-  u32 ref_rt;
-  u32 rest[];
-};
-
-struct ospf_tlv
-{
-#ifdef CPU_BIG_ENDIAN
-  u16 type;
-  u16 length;
-#else
-  u16 length;
-  u16 type;
-#endif
-  u32 data[];
-};
-
-
-static inline uint
-lsa_net_count(struct ospf_lsa_header *lsa)
-{
-  return (lsa->length - sizeof(struct ospf_lsa_header) - sizeof(struct ospf_lsa_net))
-    / sizeof(u32);
-}
 
 /* In ospf_area->rtr we store paths to routers, but we use RID (and not IP address)
    as index, so we need to encapsulate RID to IP address */
@@ -1019,11 +740,17 @@ void ospf_iface_new(struct ospf_area *oa, struct ifa *addr, struct ospf_iface_pa
 void ospf_iface_new_vlink(struct ospf_proto *p, struct ospf_iface_patt *ip);
 void ospf_iface_remove(struct ospf_iface *ifa);
 void ospf_iface_shutdown(struct ospf_iface *ifa);
+
 int ospf_iface_assure_bufsize(struct ospf_iface *ifa, uint plen);
 int ospf_iface_reconfigure(struct ospf_iface *ifa, struct ospf_iface_patt *new);
 void ospf_reconfigure_ifaces(struct ospf_proto *p);
 void ospf_open_vlink_sk(struct ospf_proto *p);
 struct nbma_node *find_nbma_node_(list *nnl, ip_addr ip);
+void ospf_open_trans_client_sk(struct ospf_iface *ifa);
+void ospf_stream_reset(struct ospf_iface *ifa);
+void ospf_stream_err_hook(sock *sk, int err);
+void ospf_iface_connected(sock *sk);
+int ospf_stream_rx_hook(sock *sk, uint UNUSED arg);
 
 static inline struct nbma_node * find_nbma_node(struct ospf_iface *ifa, ip_addr ip)
 { return find_nbma_node_(&ifa->nbma_list, ip); }

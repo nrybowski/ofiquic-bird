@@ -44,6 +44,8 @@
 #include "sysdep/unix/unix.h"
 #include CONFIG_INCLUDE_SYSIO_H
 
+#include "quic_sock/picoquic_sock_api.h"
+
 /* Maximum number of calls of tx handler for one socket in one
  * poll iteration. Should be small enough to not monopolize CPU by
  * one protocol instance.
@@ -55,6 +57,8 @@
    this to gen small latencies */
 #define MAX_RX_STEPS 4
 
+
+static inline void sk_free_tls_config(sock *s);
 
 /*
  *	Tracked Files
@@ -617,6 +621,11 @@ sk_set_ttl(sock *s, int ttl)
 {
   s->ttl = ttl;
 
+  /* unable to set ttl for quic socket */
+  if (QUIC_TYPE(s)) {
+      return 0;
+  }
+
   if (sk_is_ipv4(s))
     return sk_set_ttl4(s, ttl);
   else
@@ -637,6 +646,11 @@ sk_set_ttl(sock *s, int ttl)
 int
 sk_set_min_ttl(sock *s, int ttl)
 {
+    /* unable to set ttl for quic socket */
+    if (QUIC_TYPE(s)) {
+        return 0;
+    }
+
   if (sk_is_ipv4(s))
     return sk_set_min_ttl4(s, ttl);
   else
@@ -721,6 +735,44 @@ sk_log_error(sock *s, const char *p)
 }
 
 
+void sk_set_tls_config(sock *s, int insecure, const char *cert,
+                       const char *key, const char *alpn,
+                       const char *tls_keylog_file, int client_require_auth,
+                       const char *tls_root_ca, const char *remote_sni,
+		       const char *qlog_dir) {
+    size_t tls_conf_size;
+
+    if (!cert) {
+        log(L_ERR "TLS Certificate is not set !");
+    } if (!key) {
+        log(L_ERR "TLS Key is not set !");
+    }
+
+    tls_conf_size = sizeof(struct tls_config) + sizeof(struct alpn_buffer);
+
+    s->tls_config = mb_allocz(s->pool, tls_conf_size);
+
+    s->tls_config->insecure = !!insecure;
+    s->tls_config->private_key_file = key;
+    s->tls_config->certificate_file = cert;
+    s->tls_config->secret_log_file = tls_keylog_file;
+    s->tls_config->require_client_authentication = client_require_auth;
+    s->tls_config->root_ca_file = tls_root_ca;
+    s->tls_config->sni = remote_sni;
+    //s->tls_config->qlog_dir = qlog_dir;
+    s->tls_config->nb_alpn = 1;
+    s->tls_config->alpn[0].alpn_name = alpn;
+    s->tls_config->alpn[0].alpn_size = strnlen(alpn, 15); /* todo better handle this */
+}
+
+
+static inline void sk_free_tls_config(sock *s) {
+    if (!s->tls_config) return;
+    mb_free(s->tls_config);
+    s->tls_config = NULL;
+}
+
+
 /*
  *	Actual struct birdsock code
  */
@@ -799,6 +851,8 @@ sk_free(resource *r)
 
   sk_free_bufs(s);
 
+  //sk_free_tls_config(s);
+
 #ifdef HAVE_LIBSSH
   if (s->type == SK_SSH || s->type == SK_SSH_ACTIVE)
     sk_ssh_free(s);
@@ -817,8 +871,14 @@ sk_free(resource *r)
     rem_node(&s->n);
   }
 
-  if (s->type != SK_SSH && s->type != SK_SSH_ACTIVE)
-    close(s->fd);
+  if (s->type != SK_SSH && s->type != SK_SSH_ACTIVE){
+    if (QUIC_TYPE(s)) picoquic_s_close(s->fd);
+    else close(s->fd);
+  }
+
+  if ((s->type == SK_UNIX_ACTIVE || s->type == SK_UNIX) && s->host != NULL) {
+      mb_free((char *)s->host); /* yes, I know, this is ugly hack */
+  }
 
   s->fd = -1;
 }
@@ -925,8 +985,14 @@ sk_setup(sock *s)
   if (s->type == SK_SSH_ACTIVE)
     return 0;
 
+  if (QUIC_TYPE(s))
+      return 0;
+
   if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0)
     ERR("O_NONBLOCK");
+
+  if (s->type == SK_UNIX_ACTIVE)
+    return 0;
 
   if (!s->af)
     return 0;
@@ -1050,6 +1116,33 @@ sk_tcp_connected(sock *s)
   s->tx_hook(s);
 }
 
+static void
+sk_unix_connected(sock *s) {
+    s->type = SK_UNIX;
+    sk_alloc_bufs(s);
+    s->tx_hook(s);
+}
+
+static void
+sk_quic_connected(sock *s)
+{
+    sockaddr sa;
+    unsigned long ifidx;
+    int sa_len = sizeof(sa);
+
+    if ((picoquic_getsockname(s->fd, &sa.sa, &sa_len, &ifidx) < 0) ||
+        (sockaddr_read(&sa, s->af, &s->saddr, &s->iface, &s->sport) < 0))
+        log(L_WARN "SOCK: Cannot get local IP address for QUIC>");
+
+    s->type = SK_QUIC_ACTIVE_CONNECTED;
+    s->lifindex = ifidx;
+    //sk_alloc_bufs(s);
+    /* little hack to not put this socket in the pollfd */
+    s->tpos = s->ttx;
+
+    s->tx_hook(s);
+}
+
 #ifdef HAVE_LIBSSH
 static void
 sk_ssh_connected(sock *s)
@@ -1060,19 +1153,87 @@ sk_ssh_connected(sock *s)
 }
 #endif
 
+void sk_close_transport(sock *sk) {
+
+    if (!QUIC_TYPE(sk)) {
+        log(L_ERR "Trying to close a non-stream socket!");
+	return;
+    }
+
+    sk_free((resource *)sk);
+}
+
+int sk_open_stream(sock *sk, void (*tx_hook)(struct birdsock *)) {
+    int stream_fd;
+    sock *t;
+
+    if (sk->type != SK_QUIC_ACTIVE_CONNECTED) {
+        log(L_ERR "Trying to create stream to a non connected QUIC Socket !");
+    }
+
+    stream_fd = picoquic_open_stream(sk->fd);
+
+    if (stream_fd < 0) {
+        log(L_ERR "Unable to open stream !");
+    }
+
+    t = sk_new(sk->pool);
+    t->fd = stream_fd;
+    t->type = SK_QUIC;
+    t->data = sk->data;
+    t->af = sk->af;
+    t->ttl = sk->ttl;
+    t->tos = sk->tos;
+    t->vrf = sk->vrf;
+    t->rbsize = sk->rbsize;
+    t->tbsize = sk->tbsize;
+    t->iface = sk->iface;
+    t->lifindex = t->iface->index;
+    t->laddr = sk->laddr;
+    t->faddr = sk->daddr;
+
+    sk_insert(t);
+    sk_alloc_bufs(t);
+    tx_hook(t);
+    return 1;
+}
+
 static int
 sk_passive_connected(sock *s, int type)
 {
+  int fd;
+  unsigned long ifidx;
   sockaddr loc_sa, rem_sa;
   int loc_sa_len = sizeof(loc_sa);
   int rem_sa_len = sizeof(rem_sa);
 
-  int fd = accept(s->fd, ((type == SK_TCP) ? &rem_sa.sa : NULL), &rem_sa_len);
-  if (fd < 0)
-  {
-    if ((errno != EINTR) && (errno != EAGAIN))
-      s->err_hook(s, errno);
-    return 0;
+  switch (s->type) {
+      case SK_QUIC_PASSIVE:
+          fd = picoquic_accept(s->fd, &rem_sa.sa, &rem_sa_len);
+          if (fd < 0) {
+              if (errno != EWOULDBLOCK) {
+		  log("Hook 0");
+                  s->err_hook(s, errno);
+	      }
+              return 0;
+          }
+          break;
+      case SK_QUIC_PASSIVE_CONNECTED:
+          fd = picoquic_accept_stream(s->fd, &rem_sa.sa, &rem_sa_len);
+          if (fd < 0) {
+	      log("Hook 1");
+              s->err_hook(s, 0);
+              return 0;
+          }
+          break;
+      default:
+          fd = accept(s->fd, ((type == SK_TCP) ? &rem_sa.sa : NULL), &rem_sa_len);
+          if (fd < 0)
+          {
+              if ((errno != EINTR) && (errno != EAGAIN))
+                  s->err_hook(s, errno);
+              return 0;
+          }
   }
 
   sock *t = sk_new(s->pool);
@@ -1086,6 +1247,10 @@ sk_passive_connected(sock *s, int type)
   t->rbsize = s->rbsize;
   t->tbsize = s->tbsize;
 
+
+
+  uint port;
+
   if (type == SK_TCP)
   {
     if ((getsockname(fd, &loc_sa.sa, &loc_sa_len) < 0) ||
@@ -1094,6 +1259,27 @@ sk_passive_connected(sock *s, int type)
 
     if (sockaddr_read(&rem_sa, s->af, &t->daddr, &t->iface, &t->dport) < 0)
       log(L_WARN "SOCK: Cannot get remote IP address for TCP<");
+  } else if (type == SK_QUIC_PASSIVE_CONNECTED) {
+      if ((picoquic_getsockname(fd, &loc_sa.sa, &loc_sa_len, &ifidx) < 0) ||
+          (sockaddr_read(&loc_sa, s->af, &t->saddr, &t->iface, &t->sport) < 0))
+          log(L_WARN "SOCK: Cannot get local IP address for QUIC<");
+      t->lifindex = ifidx;
+      if (sockaddr_read(&rem_sa, s->af, &t->daddr, &t->iface, &t->dport) < 0)
+          log(L_WARN "SOCK: Cannot get remote IP address for QUIC<");
+      log("here %I %i", s->laddr, ifidx);
+      t->lifindex = ifidx;
+      t->data = s->data;	/* struct ospf_proto */
+      t->laddr = s->laddr;
+      sockaddr_read(&rem_sa, s->af, &t->faddr, &t->iface, &port);
+  } else if (type == SK_QUIC) {
+      t->saddr = s->saddr;
+      t->sport = s->sport;
+      t->daddr = s->daddr;
+      t->dport = s->dport;
+      t->iface = s->iface;
+      t->lifindex = t->iface ? t->iface->index : s->lifindex;
+      t->laddr = s->laddr;
+      sockaddr_read(&rem_sa, s->af, &t->faddr, &t->iface, &port);
   }
 
   if (sk_setup(t) < 0)
@@ -1102,7 +1288,8 @@ sk_passive_connected(sock *s, int type)
     log(L_ERR "SOCK: Incoming connection: %s%#m", t->err);
 
     /* FIXME: handle it better in rfree() */
-    close(t->fd);
+    if (QUIC_TYPE(s)) picoquic_s_close(t->fd);
+    else close(t->fd);
     t->fd = -1;
     rfree(t);
     return 1;
@@ -1309,6 +1496,24 @@ sk_open_ssh(sock *s)
 }
 #endif
 
+int sk_open_active_unix(sock *sk, const char *control_path) {
+    size_t check_size;
+
+    if (sk->type != SK_UNIX_ACTIVE) {
+        return -1;
+    }
+
+    check_size = strnlen(control_path, 109);
+    if (check_size > 108) {
+        return -1;
+    }
+
+    sk->host = mb_alloc(sk->pool, check_size);
+    strncpy((char *)sk->host, control_path, check_size); /* Yes, I know this is ugly cast */
+
+    return sk_open(sk);
+}
+
 /**
  * sk_open - open a socket
  * @s: socket
@@ -1329,7 +1534,7 @@ sk_open(sock *s)
   ip_addr bind_addr = IPA_NONE;
   sockaddr sa;
 
-  if (s->type <= SK_IP)
+  if (s->type <= SK_IP  || QUIC_TYPE(s))
   {
     /*
      * For TCP/IP sockets, Address family (IPv4 or IPv6) can be specified either
@@ -1373,6 +1578,10 @@ sk_open(sock *s)
     bind_addr = s->saddr;
     do_bind = bind_port || ipa_nonzero(bind_addr);
     break;
+  case SK_UNIX_ACTIVE:
+    af = AF_UNIX;
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    break;
 
 #ifdef HAVE_LIBSSH
   case SK_SSH_ACTIVE:
@@ -1380,7 +1589,15 @@ sk_open(sock *s)
     fd = sk_open_ssh(s);
     break;
 #endif
-
+  case SK_QUIC_ACTIVE:
+    s->ttx = "";
+    /* Fall through */
+  case SK_QUIC_PASSIVE:
+    fd = picoquic_socket();
+    bind_port = s->sport;
+    bind_addr = s->saddr;
+    do_bind = bind_port || ipa_nonzero(bind_addr);
+    break;
   case SK_UDP:
     fd = socket(af, SOCK_DGRAM, IPPROTO_UDP);
     bind_port = s->sport;
@@ -1413,7 +1630,12 @@ sk_open(sock *s)
   if (sk_setup(s) < 0)
     goto err;
 
-  if (do_bind)
+  if (do_bind && QUIC_TYPE(s)) {
+      sockaddr_fill(&sa, s->af, bind_addr, s->iface, bind_port);
+      if (picoquic_bind(fd, &sa.sa, SA_LEN(sa)) != 0) {
+          ERR2("picoquic_bind");
+      }
+  } else if (do_bind && !QUIC_TYPE(s))
   {
     if (bind_port)
     {
@@ -1464,7 +1686,34 @@ sk_open(sock *s)
     if (listen(fd, 8) < 0)
       ERR2("listen");
     break;
-
+  case SK_QUIC_ACTIVE:
+    sockaddr_fill(&sa, s->af, s->daddr, s->iface, s->dport);
+    if (picoquic_connect(fd, &sa.sa, SA_LEN(sa), s->tls_config) >= 0)
+        sk_quic_connected(s);
+    else if (errno == ECONNREFUSED)
+        ERR2("QUIC Connect ECONNREFUSED");
+    else if (errno != EINPROGRESS)
+        ERR2("QUIC Connect");
+    break;
+  case SK_QUIC_PASSIVE:
+    if (picoquic_listen(fd, s->tls_config) < 0)
+      ERR2("QUIC listen");
+    break;
+  case SK_UNIX_ACTIVE:
+    {
+      /* little hack, put control_path to sk->host */
+      struct sockaddr_un un_addr;
+      memset(&un_addr, 0, sizeof(un_addr));
+      un_addr.sun_family = AF_UNIX;
+      strncpy(un_addr.sun_path, s->host, sizeof(un_addr.sun_path) - 1);
+      if (connect(fd, (const struct sockaddr *) &un_addr, sizeof(un_addr)) >= 0) {
+          sk_unix_connected(s);
+      } else if (errno != EINTR && errno != EAGAIN && errno != EINPROGRESS &&
+                  errno != ECONNREFUSED && errno != EHOSTUNREACH && errno != ENETUNREACH) {
+          ERR2("UNIX Connect");
+      }
+    }
+    break;
   case SK_SSH_ACTIVE:
   case SK_MAGIC:
     break;
@@ -1479,7 +1728,8 @@ sk_open(sock *s)
   return 0;
 
 err:
-  close(fd);
+  if (QUIC_TYPE(s)) picoquic_s_close(fd);
+  else close(fd);
   s->fd = -1;
   return -1;
 }
@@ -1667,6 +1917,20 @@ sk_maybe_write(sock *s)
     }
     reset_tx_buffer(s);
     return 1;
+  case SK_QUIC:
+    while (s->ttx != s->tpos) {
+      e = picoquic_write(s->fd, s->ttx, s->tpos - s->ttx);
+          if (e < 0) {
+              reset_tx_buffer(s);
+              /* EPIPE is just a connection close notification during TX */
+	      log("Hook 2");
+              s->err_hook(s, 0);
+              return -1;
+          }
+          s->ttx += e;
+      }
+      reset_tx_buffer(s);
+      return 1;
 
 #ifdef HAVE_LIBSSH
   case SK_SSH:
@@ -1865,6 +2129,33 @@ sk_read_noflush(sock *s, int revents)
   case SK_UNIX_PASSIVE:
     return sk_passive_connected(s, SK_UNIX);
 
+  case SK_QUIC_PASSIVE:
+      return sk_passive_connected(s, SK_QUIC_PASSIVE_CONNECTED);
+
+  case SK_QUIC_PASSIVE_CONNECTED:
+      return sk_passive_connected(s, SK_QUIC);
+
+  case SK_QUIC: {
+    int c = picoquic_read(s->fd, s->rpos, s->rbuf + s->rbsize - s->rpos);
+
+    if (c < 0) {
+      if (errno != EAGAIN) {
+        log(L_ERR "picoquic_read failed");
+        s->err_hook(s, 0);
+      } else if (errno == EAGAIN && !(revents & POLLIN)) {
+        log(L_ERR "picoquic_read: Got EAGAIN from read when revents=%x (without POLLIN)", revents);
+        s->err_hook(s, 0);
+      }
+    } else if (!c) {
+	log("Hook 3");
+        s->err_hook(s, 0);
+    } else {
+      s->rpos += c;
+      call_rx_hook(s, s->rpos - s->rbuf);
+      return 1;
+    }
+    return 0;
+  }
   case SK_TCP:
   case SK_UNIX:
     {
@@ -1941,6 +2232,16 @@ sk_write_noflush(sock *s)
 	s->err_hook(s, errno);
       return 0;
     }
+  case SK_QUIC_ACTIVE: {
+    sockaddr sa;
+    sockaddr_fill(&sa, s->af, s->daddr, s->iface, s->dport);
+    if (picoquic_connect(s->fd, &sa.sa, SA_LEN(sa), s->tls_config) >= 0)
+      sk_quic_connected(s);
+    else if (errno != EINPROGRESS) {
+      s->err_hook(s, errno);
+    }
+    return 0;
+  }
 
 #ifdef HAVE_LIBSSH
   case SK_SSH_ACTIVE:
@@ -2176,6 +2477,13 @@ watchdog_stop(void)
 /*
  *	Main I/O Loop
  */
+
+void io_quic_init(void) {
+    if (picoquic_init("bird") != 0) {
+        log(L_FATAL "picoquic Socket API failed to start !");
+        abort();
+    }
+}
 
 void
 io_init(void)

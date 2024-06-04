@@ -127,7 +127,8 @@ ospf_advance_lsa(struct ospf_proto *p, struct top_hash_entry *en, struct ospf_ls
        * reaction is needed and we are already limited by MinLSArrival.
        */
 
-      mb_free(body);
+      if (body)
+        mb_free(body);
 
       en->lsa.sn = lsa->sn + 1;
       en->lsa.age = 0;
@@ -199,6 +200,11 @@ ospf_advance_lsa(struct ospf_proto *p, struct top_hash_entry *en, struct ospf_ls
 static int
 ospf_do_originate_lsa(struct ospf_proto *p, struct top_hash_entry *en, void *lsa_body, u16 lsa_blen, u16 lsa_opts)
 {
+
+  /* Initiate oFIB while current LSA is left unchanged */
+  if(EMPTY_LIST(p->ofib) && p->ofib_neigh)
+    ofib_cb(p->ofib_neigh);
+
   /* Enforce MinLSInterval */
   if (!en->init_age && en->inst_time && (lsa_inst_age(en) < MINLSINTERVAL))
     return 0;
@@ -253,7 +259,18 @@ ospf_do_originate_lsa(struct ospf_proto *p, struct top_hash_entry *en, void *lsa
   OSPF_TRACE(D_EVENTS, "Originating LSA: Type: %04x, Id: %R, Rt: %R, Seq: %08x",
 	     en->lsa_type, en->lsa.id, en->lsa.rt, en->lsa.sn);
 
-  ospf_flood_lsa(p, en, NULL);
+  /* LSA has been originated */
+  p->ofib_lsa_orignated |= 0x1;
+
+  /* If the first node in the ordered list is already connected, launch its callback */
+  if (p->ofib_lsa_orignated & 0x2) {
+      struct opref *first = HEAD(p->ofib);
+      ev_schedule(first->cb);
+  }
+
+  /* If no oFIB, classical flooding */
+  if(EMPTY_LIST(p->ofib) && !p->ofib_neigh)
+     ospf_flood_lsa(p, en, NULL);
 
   if (en->mode == LSA_M_BASIC)
   {
@@ -936,6 +953,7 @@ prepare_rt3_lsa_body(struct ospf_proto *p, struct ospf_area *oa)
 static void
 ospf_originate_rt_lsa(struct ospf_proto *p, struct ospf_area *oa)
 {
+
   struct ospf_new_lsa lsa = {
     .type = LSA_T_RT,
     .dom  = oa->areaid,

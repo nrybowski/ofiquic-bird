@@ -929,6 +929,9 @@ main(int argc, char **argv)
 
   main_thread_init();
 
+  /* QUIC io init (after fork since a thread is created) */
+  io_quic_init();
+
   write_pid_file();
 
   signal_init();
